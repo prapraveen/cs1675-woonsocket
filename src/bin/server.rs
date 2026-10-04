@@ -1,8 +1,11 @@
 use clap::Parser;
+use quanta::Instant;
 use std::{
     io,
-    net::{TcpListener, TcpStream},
+    net::{Shutdown, TcpListener, TcpStream},
     path::PathBuf,
+    thread,
+    time::Duration,
 };
 
 #[derive(Debug, Parser)]
@@ -19,32 +22,68 @@ struct ServerArgs {
 
 fn main() -> io::Result<()> {
     let args = ServerArgs::parse();
+    let deadline = Instant::now() + Duration::from_secs(args.runtime_secs);
 
     let listener = TcpListener::bind(("0.0.0.0", args.port))?;
+    listener.set_nonblocking(true)?;
     println!("Listening on port {}", args.port);
+    let mut connections = Vec::new();
 
-    for connection in listener.incoming() {
-        match connection {
-            Ok(stream) => {
-                std::thread::spawn(move || match handle_connection(stream) {
-                    Ok(_) => {}
-                    Err(e) => eprintln!("Connection error: {e}"),
+    while Instant::now() < deadline {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                // Keep a handle so main can unblock this worker at shutdown.
+                let shutdown_stream = match stream.try_clone() {
+                    Ok(stream) => stream,
+                    Err(e) => {
+                        eprintln!("Error cloning connection: {e}");
+                        continue;
+                    }
+                };
+                let worker = thread::spawn(move || {
+                    if let Err(e) = handle_connection(stream, deadline) {
+                        if Instant::now() < deadline {
+                            eprintln!("Connection error: {e}");
+                        }
+                    }
                 });
+                connections.push((shutdown_stream, worker));
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(10));
             }
             Err(e) => {
                 eprintln!("Error accepting connection: {e}");
+                break;
             }
         };
     }
 
+    drop(listener);
+    // Wake workers blocked in reads or writes before waiting for them.
+    for (stream, _) in &connections {
+        let _ = stream.shutdown(Shutdown::Both);
+    }
+    let mut worker_panicked = false;
+    for (_, worker) in connections {
+        worker_panicked |= worker.join().is_err();
+    }
+    println!("Server shut down");
+    if worker_panicked {
+        return Err(io::Error::other("connection worker panicked"));
+    }
     Ok(())
 }
 
-fn handle_connection(mut stream: TcpStream) -> io::Result<()> {
+fn handle_connection(mut stream: TcpStream, deadline: Instant) -> io::Result<()> {
+    stream.set_nonblocking(false)?;
     stream.set_nodelay(true)?;
-    loop {
+    while Instant::now() < deadline {
         let request = woonsocket::read_request(&mut stream)?;
-        let start = quanta::Instant::now();
+        if Instant::now() >= deadline {
+            break;
+        }
+        let start = Instant::now();
         let payload = request.work.perform();
         let server_processing_time = start.elapsed().as_nanos() as u64;
 
@@ -57,4 +96,5 @@ fn handle_connection(mut stream: TcpStream) -> io::Result<()> {
         };
         woonsocket::write_response(&mut stream, &response)?;
     }
+    Ok(())
 }
