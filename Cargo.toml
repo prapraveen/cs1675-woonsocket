@@ -1,0 +1,13 @@
+[package]
+name = "woonsocket"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+woonsocket-work = { git = "https://github.com/cs1675/woonsocket-work", features = ["argparse"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+quanta = "0.12"
+rand = "0.8"
+rand_distr = "0.4"
