@@ -21,12 +21,23 @@ struct ServerArgs {
 }
 
 fn main() -> io::Result<()> {
+    // Use std here so diagnostics include any quanta initialization time.
+    let process_start = std::time::Instant::now();
+    log_event(process_start, "Server main entered");
     let args = ServerArgs::parse();
+    log_event(
+        process_start,
+        &format!("Arguments parsed; runtime={}s", args.runtime_secs),
+    );
     let mut deadline = None;
 
     let listener = TcpListener::bind(("0.0.0.0", args.port))?;
     listener.set_nonblocking(true)?;
     println!("Listening on port {}", args.port);
+    log_event(
+        process_start,
+        "Listener ready; waiting for first connection",
+    );
     let mut connections = Vec::new();
 
     while deadline.is_none_or(|end| Instant::now() < end) {
@@ -34,8 +45,20 @@ fn main() -> io::Result<()> {
             Ok((stream, _)) => {
                 // All workers share the timer started by the first connection.
                 let deadline = *deadline.get_or_insert_with(|| {
+                    log_event(
+                        process_start,
+                        "First connection accepted; initializing runtime timer",
+                    );
+                    let deadline = Instant::now() + Duration::from_secs(args.runtime_secs);
                     println!("First connection accepted; starting runtime timer");
-                    Instant::now() + Duration::from_secs(args.runtime_secs)
+                    log_event(
+                        process_start,
+                        &format!(
+                            "Runtime timer started; shutdown expected near elapsed={:.3}s",
+                            process_start.elapsed().as_secs_f64() + args.runtime_secs as f64
+                        ),
+                    );
+                    deadline
                 });
                 // Keep a handle so main can unblock this worker at shutdown.
                 let shutdown_stream = match stream.try_clone() {
@@ -64,20 +87,36 @@ fn main() -> io::Result<()> {
         };
     }
 
+    if deadline.is_some_and(|end| Instant::now() >= end) {
+        log_event(process_start, "Runtime deadline reached");
+    }
+    log_event(
+        process_start,
+        "Stopping listener and shutting down connection sockets",
+    );
     drop(listener);
     // Wake workers blocked in reads or writes before waiting for them.
     for (stream, _) in &connections {
         let _ = stream.shutdown(Shutdown::Both);
     }
+    log_event(process_start, "Joining connection workers");
     let mut worker_panicked = false;
     for (_, worker) in connections {
         worker_panicked |= worker.join().is_err();
     }
     println!("Server shut down");
+    log_event(
+        process_start,
+        "All connection workers joined; server exiting",
+    );
     if worker_panicked {
         return Err(io::Error::other("connection worker panicked"));
     }
     Ok(())
+}
+
+fn log_event(start: std::time::Instant, message: &str) {
+    eprintln!("[elapsed={:.3}s] {message}", start.elapsed().as_secs_f64());
 }
 
 fn handle_connection(mut stream: TcpStream, deadline: Instant) -> io::Result<()> {
