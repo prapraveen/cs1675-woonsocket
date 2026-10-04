@@ -22,16 +22,21 @@ struct ServerArgs {
 
 fn main() -> io::Result<()> {
     let args = ServerArgs::parse();
-    let deadline = Instant::now() + Duration::from_secs(args.runtime_secs);
+    let mut deadline = None;
 
     let listener = TcpListener::bind(("0.0.0.0", args.port))?;
     listener.set_nonblocking(true)?;
     println!("Listening on port {}", args.port);
     let mut connections = Vec::new();
 
-    while Instant::now() < deadline {
+    while deadline.is_none_or(|end| Instant::now() < end) {
         match listener.accept() {
             Ok((stream, _)) => {
+                // All workers share the timer started by the first connection.
+                let deadline = *deadline.get_or_insert_with(|| {
+                    println!("First connection accepted; starting runtime timer");
+                    Instant::now() + Duration::from_secs(args.runtime_secs)
+                });
                 // Keep a handle so main can unblock this worker at shutdown.
                 let shutdown_stream = match stream.try_clone() {
                     Ok(stream) => stream,
