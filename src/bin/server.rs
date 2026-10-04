@@ -29,7 +29,8 @@ fn main() -> io::Result<()> {
         process_start,
         &format!("Arguments parsed; runtime={}s", args.runtime_secs),
     );
-    let mut deadline = None;
+    let deadline = Instant::now() + Duration::from_secs(args.runtime_secs);
+    log_event(process_start, "Runtime timer started at startup");
 
     let listener = TcpListener::bind(("0.0.0.0", args.port))?;
     listener.set_nonblocking(true)?;
@@ -40,26 +41,12 @@ fn main() -> io::Result<()> {
     );
     let mut connections = Vec::new();
 
-    while deadline.is_none_or(|end| Instant::now() < end) {
+    while Instant::now() < deadline {
         match listener.accept() {
             Ok((stream, _)) => {
-                // All workers share the timer started by the first connection.
-                let deadline = *deadline.get_or_insert_with(|| {
-                    log_event(
-                        process_start,
-                        "First connection accepted; initializing runtime timer",
-                    );
-                    let deadline = Instant::now() + Duration::from_secs(args.runtime_secs);
-                    println!("First connection accepted; starting runtime timer");
-                    log_event(
-                        process_start,
-                        &format!(
-                            "Runtime timer started; shutdown expected near elapsed={:.3}s",
-                            process_start.elapsed().as_secs_f64() + args.runtime_secs as f64
-                        ),
-                    );
-                    deadline
-                });
+                if connections.is_empty() {
+                    log_event(process_start, "First connection accepted");
+                }
                 // Keep a handle so main can unblock this worker at shutdown.
                 let shutdown_stream = match stream.try_clone() {
                     Ok(stream) => stream,
@@ -87,7 +74,7 @@ fn main() -> io::Result<()> {
         };
     }
 
-    if deadline.is_some_and(|end| Instant::now() >= end) {
+    if Instant::now() >= deadline {
         log_event(process_start, "Runtime deadline reached");
     }
     log_event(

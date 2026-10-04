@@ -2,7 +2,7 @@ use std::{
     fs::{self, File},
     hint::spin_loop,
     io::{self, BufWriter, Write},
-    net::{Shutdown, SocketAddr, TcpStream},
+    net::{SocketAddr, TcpStream},
     thread,
     time::Duration,
 };
@@ -14,6 +14,7 @@ use woonsocket_work::{
     args::{OpenLoopKind, WoonsocketClientOpt},
 };
 
+use crate::client_run::ClientRun;
 use crate::{Request, Response, read_response, write_request};
 
 struct SendRecord {
@@ -75,6 +76,8 @@ pub fn run(args: &WoonsocketClientOpt, interval_us: u64, kind: &OpenLoopKind) ->
 
     let start = Instant::now() + Duration::from_millis(100);
     let deadline = start + Duration::from_nanos(runtime_ns);
+    let control = ClientRun::new(start, Duration::from_nanos(runtime_ns), shutdown_handles);
+    let control = &control;
     let mut first_error = None;
     thread::scope(|scope| {
         let mut handles = Vec::new();
@@ -84,7 +87,7 @@ pub fn run(args: &WoonsocketClientOpt, interval_us: u64, kind: &OpenLoopKind) ->
             .enumerate()
         {
             handles.push(scope.spawn(move || {
-                send_requests(
+                control.handle_result(send_requests(
                     sender,
                     worker_id as u64,
                     num_workers as u64,
@@ -94,26 +97,23 @@ pub fn run(args: &WoonsocketClientOpt, interval_us: u64, kind: &OpenLoopKind) ->
                     start,
                     deadline,
                     send_log,
-                )
+                    control,
+                ))
             }));
             handles.push(scope.spawn(move || {
-                receive_responses(
+                control.handle_result(receive_responses(
                     receiver,
                     worker_id as u64,
                     num_workers as u64,
                     start,
                     deadline,
                     receive_log,
-                )
+                    control,
+                ))
             }));
         }
 
-        while Instant::now() < deadline {
-            thread::sleep(deadline.saturating_duration_since(Instant::now()));
-        }
-        for stream in &shutdown_handles {
-            let _ = stream.shutdown(Shutdown::Both);
-        }
+        control.wait();
         for handle in handles {
             let result = handle
                 .join()
@@ -124,6 +124,15 @@ pub fn run(args: &WoonsocketClientOpt, interval_us: u64, kind: &OpenLoopKind) ->
         }
     });
 
+    let (measurement_duration_ns, termination_reason) = control.outcome();
+    for log in &mut send_logs {
+        log.records
+            .retain(|record| record.generated_ns < measurement_duration_ns);
+    }
+    for log in &mut receive_logs {
+        log.records
+            .retain(|record| record.completed_ns < measurement_duration_ns);
+    }
     let mut file = BufWriter::new(File::create(args.outpath.join("open_loop.csv"))?);
     writeln!(
         file,
@@ -138,7 +147,7 @@ pub fn run(args: &WoonsocketClientOpt, interval_us: u64, kind: &OpenLoopKind) ->
         for request in &send_log.records {
             generated += 1;
             if let Some(time) = request.sent_ns {
-                if time < runtime_ns {
+                if time < measurement_duration_ns {
                     sent += 1;
                 } else {
                     writes_finished_after_deadline += 1;
@@ -175,11 +184,16 @@ pub fn run(args: &WoonsocketClientOpt, interval_us: u64, kind: &OpenLoopKind) ->
     file.flush()?;
     // Online Poisson sampling does not enumerate arrivals beyond where a stalled
     // sender stopped. Report the expectation, not a fabricated exact count.
+    let duration_secs = measurement_duration_ns as f64 / 1e9;
     let summary = serde_json::json!({
         "kind": match kind { OpenLoopKind::Constant => "constant", OpenLoopKind::Poisson => "poisson" },
         "num_workers": num_workers,
         "runtime_secs": args.runtime_secs, "interval_us": interval_us,
-        "expected_scheduled": runtime_ns as f64 / interval_ns as f64,
+        "measurement_duration_ns": measurement_duration_ns,
+        "offered_rps": (duration_secs > 0.0).then(|| sent as f64 / duration_secs),
+        "achieved_rps": (duration_secs > 0.0).then(|| completed as f64 / duration_secs),
+        "termination_reason": termination_reason,
+        "expected_scheduled": measurement_duration_ns as f64 / interval_ns as f64,
         "generated": generated, "sent_before_deadline": sent,
         "writes_finished_after_deadline": writes_finished_after_deadline,
         "completed": completed, "generated_without_response": generated - completed,
@@ -205,6 +219,7 @@ fn send_requests(
     start: Instant,
     deadline: Instant,
     log: &mut SendLog,
+    control: &ClientRun,
 ) -> io::Result<()> {
     let interval = Duration::from_nanos(interval_ns.checked_mul(num_workers).ok_or_else(|| {
         io::Error::new(
@@ -226,12 +241,15 @@ fn send_requests(
     };
     // Cap at the deadline so very long intervals never overflow an Instant.
     let mut next_send = start + offset;
-    while next_send < deadline {
+    while !control.stopped() && next_send < deadline {
         while Instant::now() < next_send {
+            if control.stopped() {
+                return Ok(());
+            }
             spin_loop();
         }
         let generated = Instant::now();
-        if generated >= deadline {
+        if control.stopped() || generated >= deadline {
             return Ok(());
         }
         let scheduled_ns = next_send.duration_since(start).as_nanos() as u64;
@@ -254,7 +272,6 @@ fn send_requests(
             }
             Err(_) if Instant::now() >= deadline => return Ok(()),
             Err(error) => {
-                let _ = stream.shutdown(Shutdown::Both);
                 return Err(error);
             }
         }
@@ -272,14 +289,14 @@ fn receive_responses(
     start: Instant,
     deadline: Instant,
     log: &mut ReceiveLog,
+    control: &ClientRun,
 ) -> io::Result<()> {
     let mut expected_id = worker_id;
-    while Instant::now() < deadline {
+    while !control.stopped() && Instant::now() < deadline {
         let response = match read_response(&mut stream) {
             Ok(response) => response,
             Err(_) if Instant::now() >= deadline => return Ok(()),
             Err(error) => {
-                let _ = stream.shutdown(Shutdown::Both);
                 return Err(error);
             }
         };
@@ -292,7 +309,6 @@ fn receive_responses(
             || response.scheduled_ns > response.generated_ns
             || response.generated_ns > completed_ns
         {
-            let _ = stream.shutdown(Shutdown::Both);
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "invalid response ID or client timestamps",
